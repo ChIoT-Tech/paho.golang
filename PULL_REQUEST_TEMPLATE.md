@@ -1,19 +1,43 @@
-**Do not create a Pull Request without creating an issue first**
+## Before submitting
 
-*The design of your solution to the problem should be discussed and agreed in an issue before submitting the PR*
+Please create or find an issue describing the proposed change before
+opening a pull request.
 
-**ECA - Eclipse Contributer Agreement**
+- For simple bug fixes, you may open a PR immediately after creating
+  or finding the issue.
+- For larger changes, please discuss the proposed approach in the issue
+  and reach agreement with the maintainers before starting substantial
+  implementation work. This helps avoid spending time on changes
+  that cannot be accepted.
 
-Ensure you have a valid, signed [ECA](https://www.eclipse.org/legal/ECA.php) for the email address associated with your Github account (or you sign off your PR with an ECA'd address)
+## Eclipse Contributor Agreement (ECA)
 
-Please provide enough information so that others can review your pull request:
+Ensure you have a valid, signed
+[Eclipse Contributor Agreement](https://www.eclipse.org/legal/eca/).
+The author email address on your Git commits must match an email
+address associated with your Eclipse Foundation account.
 
-<!-- You can skip this if you're fixing a typo or adding documentation -->
+## Related issue
 
-**Testing**
+<!--
+Use "Closes #123" if this PR fully resolves the issue. This automatically
+closes it when the PR is merged into the repository's default branch.
+Otherwise, use "Related to #123".
+-->
 
-Any code changes should have accompanying tests.
+## Description
 
-**Closing issues**
+<!--
+Explain what this PR changes and why.
+Mention any breaking changes or compatibility considerations, if applicable.
+-->
 
-Put `closes #XXXX` in your comment to auto-close the issue that your PR fixes.
+## Testing
+
+Code changes should include accompanying tests.
+
+<!--
+Describe the tests added or updated, and how you verified the change.
+For bug fixes, include a regression test where practical.
+For changes limited to documentation or typos, you may write "Not applicable".
+-->

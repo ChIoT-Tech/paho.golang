@@ -145,6 +145,29 @@ Topic aliases are not part of the session state. This means that if messages usi
 connection drops and then sent when it comes up will not have the desired impact. Possible workaround would be to detect
 these and cancel them all when the connection drops.
 
+### Inbound topic aliases
+
+The client validates and resolves inbound topic aliases automatically, before session processing and message delivery.
+All routers and `OnPublishReceived` callbacks receive the full topic name, including callbacks added later using
+`Client.AddOnPublishReceived`. No topic alias callback is required.
+
+Alias mappings belong to the network connection and are reset on reconnection, even when the MQTT session is resumed.
+Retransmitted QoS 2 messages update alias mappings without being delivered to the application again if the session has
+already acknowledged them.
+
+To allow the broker to use aliases, set a non-zero `TopicAliasMaximum` on the CONNECT packet. For example:
+
+```go
+paho.Connect{
+    Properties: &paho.ConnectProperties{
+        TopicAliasMaximum: paho.Uint16(10),
+    },
+}
+```
+
+With AutoPaho, set this property through `ClientConfig.ConnectPacketBuilder`. An absent or zero maximum disables inbound
+aliases. Invalid aliases cause a DISCONNECT before the offending message is delivered or acknowledged.
+
 ### Multiple Servers
 
 If a Client may connect to more than one server, or the same server with different ClientIDs, then the user will need to 

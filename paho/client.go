@@ -79,6 +79,8 @@ type (
 		// created via the AddOnPublishReceived function (Client holds a copy of the slice; OnPublishReceived will not change).
 		// When a `PUBLISH` is received, the callbacks will be called in order. If a callback processes the message,
 		// then it should return true. This boolean, and any errors, will be passed to subsequent handlers.
+		// Topic aliases are resolved before session processing and before any callbacks run.
+		// Set Connect.Properties.TopicAliasMaximum to allow the server to use inbound aliases.
 		OnPublishReceived []func(PublishReceived) (bool, error)
 
 		PacketTimeout time.Duration
@@ -484,6 +486,8 @@ func (c *Client) incoming(ctx context.Context) {
 	defer c.debug.Println("client stopping, incoming stopping")
 	defer close(c.publishPackets)
 
+	// Aliases belong to this network connection and are only accessed by incoming.
+	aliases := make(inboundTopicAliases)
 	for {
 		select {
 		case <-ctx.Done():
@@ -527,6 +531,19 @@ func (c *Client) incoming(ctx context.Context) {
 				}
 			case packets.PUBLISH:
 				pb := recv.Content.(*packets.Publish)
+				// Even a QoS 2 retransmission suppressed by the session may establish
+				// an alias. Resolve now, before filtering or acknowledging the packet.
+				if err := aliases.resolve(pb, c.clientProps.TopicAliasMaximum); err != nil {
+					// Disconnect waits for incoming to finish, so let it run separately.
+					go func() {
+						var reportedErr error = err
+						if sendErr := c.Disconnect(err.Disconnect()); sendErr != nil {
+							reportedErr = errors.Join(err, fmt.Errorf("sending topic alias disconnect: %w", sendErr))
+						}
+						c.config.OnClientError(reportedErr)
+					}()
+					return
+				}
 				if pb.QoS > 0 { // QOS1 or 2 need to be recorded in session state
 					if c.handleSessionPacketError(ctx, recv.Type, c.config.Session.PacketReceived(recv, c.publishPackets)) {
 						return

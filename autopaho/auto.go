@@ -290,6 +290,9 @@ func NewConnection(ctx context.Context, cfg ClientConfig) (*ConnectionManager, e
 
 	go func() {
 		defer func() {
+			// Stop the queue worker before waiting, including when OnConnectionDown
+			// ends reconnection without the caller cancelling its context.
+			cancel()
 			c.queueWg.Wait() // Separate goroutine handling queue may be running
 			close(c.done)
 		}()

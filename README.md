@@ -147,11 +147,15 @@ these and cancel them all when the connection drops.
 
 ### Inbound topic Aliases
 
-The library and standard router do not handle inbound topic aliases by default (these will not be used by the broker
-unless you set `TopicAliasMaximum`). If you wish to use inbound aliases then set `TopicAliasMaximum` and add
-`topicaliases.NewTopicAliasHandler()` to the start of your `OnPublishReceived` slice (if you want aliases expanded
-before the message reaches your code).
+When using `OnPublishReceived`, add `topicaliases.NewTopicAliasHandler()` before callbacks that need resolved topic names.
 
+Topic aliases are handled automatically when you set the deprecated `Router` client option, or leave both `Router` and 
+`OnPublishReceived` unset. In the latter case, callbacks subsequently added using `Client.AddOnPublishReceived` receive 
+resolved topics.
+
+The broker may only use topic aliases if you advertise a non-zero `TopicAliasMaximum` in the CONNECT properties. 
+For example: `paho.Connect{Properties: &paho.ConnectProperties{TopicAliasMaximum: paho.Uint16(10)}}`. With AutoPaho, set 
+this property through `ClientConfig.ConnectPacketBuilder`.
 
 ### Multiple Servers
 

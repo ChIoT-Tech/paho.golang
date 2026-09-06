@@ -483,7 +483,23 @@ func (c *Client) routePublishPackets() {
 			if err != nil {
 				// Handler may encounter an error which requires us to drop the connection
 				if disconnectErr, ok := errors.AsType[disconnector](err); ok {
-					c.disconnectFromHandler(disconnectErr)
+					d := disconnectErr.Disconnect()
+					if d == nil {
+						d = &Disconnect{ReasonCode: packets.DisconnectUnspecifiedError}
+					}
+					// Disconnect waits for this worker to finish, so run it in another goroutine while we drain
+					// messages and let the incoming worker exit.
+					go func() {
+						var reportedErr error = disconnectErr
+						if err := c.Disconnect(d); err != nil {
+							reportedErr = errors.Join(disconnectErr, fmt.Errorf("sending handler-requested disconnect: %w", err))
+						}
+						c.config.OnClientError(reportedErr)
+					}()
+					// Session.PacketReceived may be blocked sending to `publishPackets` so drain it without
+					// any action until incoming exits and closes the channel.
+					for range c.publishPackets {
+					}
 					return
 				}
 				errs = append(errs, err)
@@ -494,22 +510,6 @@ func (c *Client) routePublishPackets() {
 			c.ack(pb)
 		}
 	}
-}
-
-// disconnectFromHandler runs Disconnect asynchronously so routePublishPackets can
-// return before Disconnect waits for the client workers to stop.
-func (c *Client) disconnectFromHandler(disconnectErr disconnector) {
-	d := disconnectErr.Disconnect()
-	if d == nil {
-		d = &Disconnect{ReasonCode: packets.DisconnectUnspecifiedError}
-	}
-	go func() {
-		var reportedErr error = disconnectErr
-		if err := c.Disconnect(d); err != nil {
-			reportedErr = errors.Join(disconnectErr, fmt.Errorf("sending handler-requested disconnect: %w", err))
-		}
-		c.config.OnClientError(reportedErr)
-	}()
 }
 
 // incoming is the Client function that reads and handles incoming

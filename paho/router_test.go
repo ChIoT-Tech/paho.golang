@@ -129,10 +129,10 @@ func Test_routeDefault(t *testing.T) {
 
 }
 
-// Issue #331 - Route had a data race around it's handling of topic aliases
-// Run with race detector
+// Test_routeAliasRace exercises concurrent calls to a shared router with aliases.
+// Run with -race to detect a recurrence of issue #331, where alias registrations
+// modified router state while holding only a read lock.
 func Test_routeAliasRace(t *testing.T) {
-	// Data race possible when an alias is set
 	r := NewStandardRouter()
 	alias := uint16(1)
 	var wg sync.WaitGroup

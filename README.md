@@ -148,12 +148,12 @@ these and cancel them all when the connection drops.
 ### Inbound topic aliases
 
 The client validates and resolves inbound topic aliases automatically, before session processing and message delivery.
-All routers and `OnPublishReceived` callbacks receive the full topic name, including callbacks added later using
-`Client.AddOnPublishReceived`. No topic alias callback is required.
+All routers and `OnPublishReceived` callbacks receive the full topic name. Library users should ignore `PUBLISH`
+`.Properties.TopicAlias` because `.Topic` will contain the full topic name.
 
-Alias mappings belong to the network connection and are reset on reconnection, even when the MQTT session is resumed.
-Retransmitted QoS 2 messages update alias mappings without being delivered to the application again if the session has
-already acknowledged them.
+The library resolves these automatically because alias mappings belong to the network connection and are reset on
+reconnection, even when the MQTT session is resumed. This means that a previously acknowledged QOS2 message (that will
+not be delivered to `OnPublishReceived`) can set an alias. Thus handling this outside of the library would be complicated.
 
 To allow the broker to use aliases, set a non-zero `TopicAliasMaximum` on the CONNECT packet. For example:
 

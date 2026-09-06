@@ -22,10 +22,13 @@ import (
 )
 
 // inboundTopicAliases is owned by incoming for the lifetime of one connection.
-// Resolve each packet before queuing it so later alias reassignments cannot
-// change the topics of packets still waiting for application callbacks.
+// Resolve each packet before queuing it so later alias reassignments cannot change the topics of packets still waiting
+// for application callbacks.
 type inboundTopicAliases map[uint16]string
 
+// resolve validates the topic and alias against the maximum advertised in CONNECT.
+// It records alias registrations or fills in p.Topic from an existing mapping.
+// Invalid packets return an error containing the required DISCONNECT reason.
 func (a inboundTopicAliases) resolve(p *packets.Publish, maximum uint16) *topicAliasError {
 	if p.Properties == nil || p.Properties.TopicAlias == nil {
 		if p.Topic == "" {
@@ -52,13 +55,17 @@ func (a inboundTopicAliases) resolve(p *packets.Publish, maximum uint16) *topicA
 	return &topicAliasError{packets.DisconnectProtocolError, fmt.Sprintf("topic alias %d not found", alias)}
 }
 
+// topicAliasError describes an invalid inbound topic or alias and its MQTT reason code.
 type topicAliasError struct {
 	reasonCode byte
 	message    string
 }
 
+// Error returns the explanation of the invalid topic or alias.
 func (e *topicAliasError) Error() string { return e.message }
 
+// Disconnect builds the packet used to report the error to the broker.
+// It does not send the packet or close the connection.
 func (e *topicAliasError) Disconnect() *Disconnect {
 	return &Disconnect{
 		ReasonCode: e.reasonCode,

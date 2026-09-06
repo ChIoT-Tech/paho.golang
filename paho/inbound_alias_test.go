@@ -31,8 +31,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// aliasTestConnection uses a real Client and session, with a broker that records
-// acknowledgments and DISCONNECT packets instead of completing QoS 2 exchanges.
+// aliasTestConnection connects a real Client and session to an in-memory broker.
+// max sets the advertised alias limit; resumed sets CONNACK's Session Present flag.
+// It returns the client, the broker connection used to send packets, and a channel recording client acknowledgments
+// and DISCONNECT packets. The broker leaves QoS 2 exchanges unfinished, so tests can resume them after reconnecting.
 func aliasTestConnection(t *testing.T, cfg ClientConfig, max *uint16, resumed bool) (*Client, net.Conn, <-chan *packets.ControlPacket) {
 	t.Helper()
 	clientConn, brokerConn := net.Pipe()
@@ -72,6 +74,8 @@ func aliasTestConnection(t *testing.T, cfg ClientConfig, max *uint16, resumed bo
 	return c, broker, received
 }
 
+// aliasTestSend sends a broker PUBLISH with a test payload and non-nil properties.
+// It fails the test if the packet cannot be written.
 func aliasTestSend(t *testing.T, broker net.Conn, p *packets.Publish) {
 	t.Helper()
 	// A nonempty payload also avoids a zero-byte net.Pipe write at packet end.
@@ -83,6 +87,8 @@ func aliasTestSend(t *testing.T, broker net.Conn, p *packets.Publish) {
 	require.NoError(t, err)
 }
 
+// aliasTestPacket waits for the next packet recorded by the broker and checks its type. A timeout or closed connection
+// fails the test instead of leaving it blocked.
 func aliasTestPacket(t *testing.T, ch <-chan *packets.ControlPacket, typ byte) *packets.ControlPacket {
 	t.Helper()
 	select {
@@ -96,6 +102,8 @@ func aliasTestPacket(t *testing.T, ch <-chan *packets.ControlPacket, typ byte) *
 	}
 }
 
+// aliasTestPublish waits for a message delivered to an application handler. It fails the test if no message arrives
+// before the timeout.
 func aliasTestPublish(t *testing.T, ch <-chan *Publish) *Publish {
 	t.Helper()
 	select {
@@ -107,6 +115,8 @@ func aliasTestPublish(t *testing.T, ch <-chan *Publish) *Publish {
 	}
 }
 
+// TestClientInboundAliasesAutomatic checks that configured callbacks, routers, and callbacks added later all receive
+// resolved topics without an alias handler.
 func TestClientInboundAliasesAutomatic(t *testing.T) {
 	for _, mode := range []string{"callbacks", "configured router", "default router", "router callback"} {
 		t.Run(mode, func(t *testing.T) {
@@ -137,6 +147,8 @@ func TestClientInboundAliasesAutomatic(t *testing.T) {
 	}
 }
 
+// TestClientInboundAliasesKeepQueuedTopics holds application callbacks while an alias is reassigned. Queued messages
+// must retain the topic that applied when each packet arrived, rather than picking up the alias's latest mapping.
 func TestClientInboundAliasesKeepQueuedTopics(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		delivered := make(chan *Publish, 4)
@@ -155,6 +167,9 @@ func TestClientInboundAliasesKeepQueuedTopics(t *testing.T) {
 	})
 }
 
+// TestClientInboundAliasOnQoS2Retransmission checks that a previously acknowledged message can register an alias after
+// reconnecting without being delivered twice. It covers automatic and manual acknowledgments and checks that a DUP
+// flag does not suppress a message the session has not previously acknowledged.
 func TestClientInboundAliasOnQoS2Retransmission(t *testing.T) {
 	for _, manual := range []bool{false, true} {
 		t.Run(fmt.Sprintf("manualAck=%t", manual), func(t *testing.T) {
@@ -207,6 +222,9 @@ func TestClientInboundAliasOnQoS2Retransmission(t *testing.T) {
 	}
 }
 
+// TestClientInboundAliasesRejectInvalid checks that invalid topics and aliases produce the expected DISCONNECT and
+// reported error before delivery or acknowledgment.
+// This must hold for every QoS, including retransmissions suppressed by the session.
 func TestClientInboundAliasesRejectInvalid(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -275,6 +293,8 @@ func TestClientInboundAliasesRejectInvalid(t *testing.T) {
 	}
 }
 
+// TestClientInboundAliasesAreConnectionScoped checks that reconnecting clears alias mappings even when both the MQTT
+// session and the router are reused.
 func TestClientInboundAliasesAreConnectionScoped(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s := state.NewInMemory()
@@ -295,6 +315,8 @@ func TestClientInboundAliasesAreConnectionScoped(t *testing.T) {
 	})
 }
 
+// TestClientInboundAliasesWithSharedRouter checks that two active connections sharing a router can use the same alias
+// number for different topics.
 func TestClientInboundAliasesWithSharedRouter(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		delivered := make(chan *Publish, 4)

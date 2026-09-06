@@ -166,6 +166,88 @@ func TestDisconnect(t *testing.T) {
 	}
 }
 
+// TestOnConnectionDownAbortShutsDown verifies that refusing reconnection stops the queue worker, closes Done, and makes
+// AwaitConnection report shutdown (#349).
+// AI Disclosure: OpenAI Codex assisted with this regression test.
+// Assisted-by: OpenAI Codex
+func TestOnConnectionDownAbortShutsDown(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer func() {
+			cancel()
+			synctest.Wait()
+		}()
+
+		// Give the server its own cancellation function so dropping the connection
+		// does not also cancel the manager and hide the shutdown bug.
+		serverCtx, dropConnection := context.WithCancel(ctx)
+		defer dropConnection()
+		server := testserver.New(paholog.NewTestLogger(t, "testServer:"))
+		serverURL, err := url.Parse(dummyURL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var serverDone chan struct{}
+		attempts, connectionDownCalls := 0, 0
+		cm, err := NewConnection(ctx, ClientConfig{
+			ServerUrls:       []*url.URL{serverURL},
+			ReconnectBackoff: NewConstantBackoff(time.Millisecond),
+			ConnectTimeout:   time.Second,
+			AttemptConnection: func(context.Context, ClientConfig, *url.URL) (net.Conn, error) {
+				attempts++
+				if attempts > 1 {
+					return nil, errors.New("unexpected reconnection attempt")
+				}
+				conn, done, err := server.Connect(serverCtx)
+				serverDone = done
+				return conn, err
+			},
+			OnConnectionDown: func() bool {
+				connectionDownCalls++
+				return false
+			},
+			ClientConfig: paho.ClientConfig{ClientID: "abort-reconnect"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		connectCtx, connectCancel := context.WithTimeout(ctx, time.Second)
+		defer connectCancel()
+		if err := cm.AwaitConnection(connectCtx); err != nil {
+			t.Fatalf("initial connection failed: %v", err)
+		}
+		synctest.Wait() // Allow the queue worker to start before dropping the connection.
+
+		dropConnection()
+		select {
+		case <-serverDone:
+		case <-time.After(time.Second):
+			t.Fatal("test server did not shut down")
+		}
+		select {
+		case <-cm.Done():
+		case <-time.After(time.Second):
+			t.Fatal("manager did not shut down after OnConnectionDown returned false")
+		}
+		if ctx.Err() != nil {
+			t.Fatal("manager shutdown should not cancel the caller's context")
+		}
+		if attempts != 1 || connectionDownCalls != 1 {
+			t.Fatalf("got %d connection attempts and %d connection-down callbacks, want one each", attempts, connectionDownCalls)
+		}
+
+		awaitCtx, awaitCancel := context.WithTimeout(ctx, time.Second)
+		defer awaitCancel()
+		if err := cm.AwaitConnection(awaitCtx); err == nil || err.Error() != "connection manager shutting down" {
+			t.Fatalf("AwaitConnection returned %v, want manager shutdown error", err)
+		}
+		if awaitCtx.Err() != nil {
+			t.Fatal("AwaitConnection waited for its caller's context to expire")
+		}
+	})
+}
+
 // TestReconnect confirms that the connection is automatically re-established when lost
 func TestReconnect(t *testing.T) {
 	t.Parallel()

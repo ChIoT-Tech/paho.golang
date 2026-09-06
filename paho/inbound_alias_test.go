@@ -10,7 +10,13 @@
  * and the Eclipse Distribution License is available at
  *    http://www.eclipse.org/org/documents/edl-v10.php.
  *
- * SPDX-License-Identifier: EPL-2.0 OR BSD-3-Clause
+ * AI Disclosure: This file was largely generated using OpenAI Codex and
+ * refined through discussion and review. The AI-generated portions are
+ * made available under CC0-1.0, rather than the project licences above.
+ * Existing and human-authored portions retain their applicable licences.
+ *
+ * SPDX-License-Identifier: (EPL-2.0 OR BSD-3-Clause) AND CC0-1.0
+ * Assisted-by: OpenAI Codex
  */
 
 package paho

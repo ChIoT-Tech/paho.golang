@@ -983,7 +983,10 @@ func (c *Client) publishQoS12(ctx context.Context, pb *packets.Publish, o Publis
 			pubrec := resp.Content.(*packets.Pubrec)
 			pr := PublishResponseFromPubrec(pubrec)
 			c.debug.Printf("received final PUBREC for %d (reason code: 0x%02X)", pb.PacketID, pr.ReasonCode)
-			return pr, fmt.Errorf("error publishing (PUBREC reason code: 0x%02X): %s", pubrec.ReasonCode, pubrec.Reason())
+			return pr, fmt.Errorf(
+				"QoS 2 publish ended at PUBREC (reason code: 0x%02X): %s",
+				pubrec.ReasonCode, pubrec.Reason(),
+			)
 		default:
 			return nil, fmt.Errorf("received %d instead of PUBCOMP", resp.Type)
 		}

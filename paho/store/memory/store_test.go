@@ -22,6 +22,7 @@ import (
 	"testing"
 
 	"github.com/eclipse/paho.golang/packets"
+	pstore "github.com/eclipse/paho.golang/paho/store"
 )
 
 // TestMemoryStore basic tests of the memory store
@@ -35,7 +36,7 @@ func TestMemoryStore(t *testing.T) {
 		pcp.Content.(*packets.Publish).QoS = 1 // ID will only be written for QOS1+
 		pcp.Content.(*packets.Publish).Payload = []byte(fmt.Sprintf("%d", id))
 
-		if err := s.Put(id, packets.PUBLISH, pcp); err != nil {
+		if err := s.Put(id, packets.PUBLISH, pcp, pstore.Metadata{}); err != nil {
 			t.Fatalf("failed to put: %s", err)
 		}
 	}
@@ -103,7 +104,7 @@ func TestMemoryStoreBig(t *testing.T) {
 		pcp.Content.(*packets.Publish).QoS = 1 // ID will only be written for QOS1+
 		pcp.Content.(*packets.Publish).Payload = []byte(fmt.Sprintf("%d", id))
 
-		if err := s.Put(id, packets.PUBLISH, pcp); err != nil {
+		if err := s.Put(id, packets.PUBLISH, pcp, pstore.Metadata{}); err != nil {
 			t.Fatalf("failed to put: %s", err)
 		}
 	}

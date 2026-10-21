@@ -25,6 +25,10 @@ import (
 type (
 	// Publish is a representation of the MQTT Publish packet
 	Publish struct {
+		// TrackingID is local application metadata, persisted with queued and
+		// in-flight publications. Packet deliberately excludes it from MQTT data.
+		// Empty disables tracking; nonempty IDs must identify individual publications.
+		TrackingID string
 		PacketID   uint16
 		QoS        byte
 		duplicate  bool // private because this should only ever be set in paho/session

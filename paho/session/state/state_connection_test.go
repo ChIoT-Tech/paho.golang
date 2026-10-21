@@ -26,6 +26,7 @@ import (
 
 	"github.com/eclipse/paho.golang/packets"
 	"github.com/eclipse/paho.golang/paho/session"
+	pstore "github.com/eclipse/paho.golang/paho/store"
 	"github.com/eclipse/paho.golang/paho/store/memory"
 )
 
@@ -78,7 +79,7 @@ func TestAddToSessionDoesNotCrossConnections(t *testing.T) {
 	}
 	result := make(chan error, 1)
 	go func() {
-		_, err := s.AddToSession(context.Background(), publish)
+		_, err := s.AddToSession(context.Background(), publish, pstore.Metadata{})
 		result <- err
 	}()
 
@@ -169,7 +170,7 @@ func TestConnectionLostRemovesNonSessionTransactions(t *testing.T) {
 	}
 
 	subscribe := &packets.Subscribe{Properties: &packets.Properties{}}
-	response, err := s.AddToSession(context.Background(), subscribe)
+	response, err := s.AddToSession(context.Background(), subscribe, pstore.Metadata{})
 	if err != nil {
 		t.Fatalf("AddToSession: %v", err)
 	}
@@ -200,7 +201,7 @@ func TestConnectionLostNotifiesCleanedTransactions(t *testing.T) {
 		t.Fatalf("ConAckReceived: %v", err)
 	}
 	publish := &packets.Publish{QoS: 1, Topic: "clean/session", Properties: &packets.Properties{}}
-	response, err := s.AddToSession(context.Background(), publish)
+	response, err := s.AddToSession(context.Background(), publish, pstore.Metadata{})
 	if err != nil {
 		t.Fatalf("AddToSession: %v", err)
 	}
@@ -227,7 +228,7 @@ func TestConnectionLostRetainsSessionTransactions(t *testing.T) {
 	}
 
 	publish := &packets.Publish{QoS: 2, Topic: "persistent/session", Properties: &packets.Properties{}}
-	response, err := s.AddToSession(context.Background(), publish)
+	response, err := s.AddToSession(context.Background(), publish, pstore.Metadata{})
 	if err != nil {
 		t.Fatalf("AddToSession: %v", err)
 	}
@@ -276,7 +277,7 @@ func (s *controlledListStore) List() ([]uint16, error) {
 
 type putFailStore struct{ *memory.Store }
 
-func (s *putFailStore) Put(uint16, byte, io.WriterTo) error {
+func (s *putFailStore) Put(uint16, byte, io.WriterTo, pstore.Metadata) error {
 	return errors.New("injected Put failure")
 }
 
@@ -309,7 +310,7 @@ func TestPendingStoreResetBlocksStaleRetransmission(t *testing.T) {
 		t.Fatalf("initial ConAckReceived: %v", err)
 	}
 	publish := &packets.Publish{QoS: 1, Topic: "stale/session", Properties: &packets.Properties{}}
-	response, err := s.AddToSession(context.Background(), publish)
+	response, err := s.AddToSession(context.Background(), publish, pstore.Metadata{})
 	if err != nil {
 		t.Fatalf("AddToSession: %v", err)
 	}
@@ -378,7 +379,7 @@ func TestAddToSessionReturnsNilChannelOnStoreFailure(t *testing.T) {
 		t.Fatalf("ConAckReceived: %v", err)
 	}
 	publish := &packets.Publish{QoS: 1, Topic: "store/failure", Properties: &packets.Properties{}}
-	response, err := s.AddToSession(context.Background(), publish)
+	response, err := s.AddToSession(context.Background(), publish, pstore.Metadata{})
 	if err == nil {
 		t.Fatal("AddToSession succeeded despite the store failure")
 	}
@@ -409,7 +410,7 @@ func TestConAckFailureRollsBackConnectionState(t *testing.T) {
 	}
 
 	publish := &packets.Publish{QoS: 1}
-	response, err := s.AddToSession(context.Background(), publish)
+	response, err := s.AddToSession(context.Background(), publish, pstore.Metadata{})
 	if !errors.Is(err, session.ErrNoConnection) {
 		t.Fatalf("AddToSession after failed CONNACK returned %v; want ErrNoConnection", err)
 	}
@@ -431,7 +432,7 @@ func TestAckAfterFailedConAck(t *testing.T) {
 		t.Fatalf("initial ConAckReceived: %v", err)
 	}
 	publish := &packets.Publish{QoS: 1, Topic: "failed/connack", Properties: &packets.Properties{}}
-	response, err := s.AddToSession(context.Background(), publish)
+	response, err := s.AddToSession(context.Background(), publish, pstore.Metadata{})
 	if err != nil {
 		t.Fatalf("AddToSessionWithResponse: %v", err)
 	}
@@ -475,7 +476,7 @@ func TestPubrecDoesNotAdvanceNonPublishTransaction(t *testing.T) {
 		t.Fatalf("ConAckReceived: %v", err)
 	}
 	subscribe := &packets.Subscribe{Properties: &packets.Properties{}}
-	response, err := s.AddToSession(context.Background(), subscribe)
+	response, err := s.AddToSession(context.Background(), subscribe, pstore.Metadata{})
 	if err != nil {
 		t.Fatalf("AddToSessionWithResponse: %v", err)
 	}
@@ -526,12 +527,12 @@ func TestAddToSessionOwnsResponseChannel(t *testing.T) {
 		t.Fatalf("ConAckReceived: %v", err)
 	}
 	first := &packets.Subscribe{Properties: &packets.Properties{}}
-	firstResponse, err := s.AddToSession(context.Background(), first)
+	firstResponse, err := s.AddToSession(context.Background(), first, pstore.Metadata{})
 	if err != nil {
 		t.Fatalf("first AddToSession: %v", err)
 	}
 	second := &packets.Subscribe{Properties: &packets.Properties{}}
-	secondResponse, err := s.AddToSession(context.Background(), second)
+	secondResponse, err := s.AddToSession(context.Background(), second, pstore.Metadata{})
 	if err != nil {
 		t.Fatalf("second AddToSession: %v", err)
 	}
@@ -584,7 +585,7 @@ func TestConAckRetriesServerStoreAfterFailure(t *testing.T) {
 	serverStore := &listFailOnceStore{Store: memory.New()}
 	stored := packets.NewControlPacket(packets.PUBREC)
 	stored.Content.(*packets.Pubrec).PacketID = 7
-	if err := serverStore.Put(7, packets.PUBREC, stored); err != nil {
+	if err := serverStore.Put(7, packets.PUBREC, stored, pstore.Metadata{}); err != nil {
 		t.Fatalf("seeding server store: %v", err)
 	}
 	s := New(memory.New(), serverStore)

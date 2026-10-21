@@ -31,7 +31,9 @@ import (
 	"github.com/eclipse/paho.golang/autopaho/queue/memory"
 	"github.com/eclipse/paho.golang/packets"
 	"github.com/eclipse/paho.golang/paho/log"
+	"github.com/eclipse/paho.golang/paho/session"
 	"github.com/eclipse/paho.golang/paho/session/state"
+	"github.com/eclipse/paho.golang/paho/store"
 	"github.com/gorilla/websocket"
 
 	"github.com/eclipse/paho.golang/paho"
@@ -478,8 +480,9 @@ type QueuePublish struct {
 }
 
 // PublishViaQueue is used to send a publication to the MQTT server via a queue (by default memory based).
-// An error will be returned if the message could not be added to the queue, otherwise the message will be delivered
-// in the background with no status updates available.
+// An error will be returned if the message could not be added to the queue; otherwise delivery is attempted in the
+// background. ClientConfig.PublishEvents can report its progress, including PublishEventQueueDiscarded if local
+// validation later rejects it and the queue entry is removed.
 // Use this function when you wish to rely upon the libraries best-effort to transmit the message; it is anticipated
 // that this will generally be in situations where the network link or power supply is unreliable.
 // Messages will be written to a queue (configuring a disk-based queue is recommended) and transmitted where possible.
@@ -493,7 +496,7 @@ func (c *ConnectionManager) PublishViaQueue(ctx context.Context, p *QueuePublish
 	if _, err := p.Packet().WriteTo(&b); err != nil {
 		return err
 	}
-	return c.queue.Enqueue(&b)
+	return c.queue.Enqueue(&b, store.Metadata{ID: p.TrackingID, QoS: p.QoS})
 }
 
 // TerminateConnectionForTest closes the active connection (if any). This function is intended for testing only, it
@@ -583,6 +586,24 @@ connectionLoop:
 					time.Sleep(1 * time.Second)
 					continue
 				}
+				metadata, err := entry.Metadata()
+				if err != nil {
+					c.errors.Printf("error reading queue metadata: %s", err)
+					if !errors.Is(err, store.ErrInvalidMetadata) {
+						if leaveErr := entry.Leave(); leaveErr != nil {
+							c.errors.Printf("error leaving queue entry: %s", leaveErr)
+						}
+						time.Sleep(time.Second)
+						continue
+					}
+					if qErr := entry.Quarantine(); qErr != nil {
+						c.errors.Printf("error quarantining queue entry: %s", qErr)
+					}
+					if onEvent := c.cfg.PublishEvents.OnEvent; onEvent != nil {
+						onEvent(session.PublishEvent{Type: session.PublishEventQueueDiscarded, Err: err})
+					}
+					continue
+				}
 				r, err := entry.Reader()
 				if err != nil {
 					c.errors.Printf("error retrieving reader for queue entry: %s", err)
@@ -598,8 +619,10 @@ connectionLoop:
 					c.errors.Printf("error retrieving packet from queue: %s", err)
 					// If the packet cannot be processed, then we need to remove it from the queue
 					// (ideally into an error queue).
-					if err := entry.Quarantine(); err != nil {
-						c.errors.Printf("error moving queue entry to quarantine: %s", err)
+					if qErr := entry.Quarantine(); qErr != nil && !errors.Is(qErr, queue.ErrEmpty) {
+						c.errors.Printf("error moving queue entry to quarantine: %s", qErr)
+					} else if onEvent := c.cfg.PublishEvents.OnEvent; onEvent != nil {
+						onEvent(session.PublishEvent{Type: session.PublishEventQueueDiscarded, Metadata: metadata, Err: err})
 					}
 					continue
 				}
@@ -607,17 +630,22 @@ connectionLoop:
 				pub, ok := p.Content.(*packets.Publish)
 				if !ok {
 					c.errors.Printf("packet from queue is not a Publish")
-					if qErr := entry.Quarantine(); qErr != nil {
-						c.errors.Printf("error moving queue entry to quarantine: %s", err)
+					if qErr := entry.Quarantine(); qErr != nil && !errors.Is(qErr, queue.ErrEmpty) {
+						c.errors.Printf("error moving queue entry to quarantine: %s", qErr)
+					} else if onEvent := c.cfg.PublishEvents.OnEvent; onEvent != nil {
+						onEvent(session.PublishEvent{Type: session.PublishEventQueueDiscarded, Metadata: metadata,
+							Err: errors.New("queued packet is not a PUBLISH")})
 					}
 					continue
 				}
+				metadata.QoS = pub.QoS
 				pub2 := paho.Publish{
-					PacketID: 0,
-					QoS:      pub.QoS,
-					Retain:   pub.Retain,
-					Topic:    pub.Topic,
-					Payload:  pub.Payload,
+					TrackingID: metadata.ID,
+					PacketID:   0,
+					QoS:        pub.QoS,
+					Retain:     pub.Retain,
+					Topic:      pub.Topic,
+					Payload:    pub.Payload,
 				}
 				pub2.InitProperties(pub.Properties)
 
@@ -627,10 +655,13 @@ connectionLoop:
 				if _, err = cli.PublishWithOptions(ctx, &pub2, paho.PublishOptions{Method: paho.PublishMethod_AsyncSend}); err != nil {
 					c.errors.Printf("error publishing from queue: %s", err)
 					if errors.Is(err, paho.ErrInvalidArguments) { // Some errors should not be retried
-						if err := entry.Remove(); err != nil {
-							c.errors.Printf("error removing queue entry: %s", err)
+						if removeErr := entry.Remove(); removeErr != nil && !errors.Is(removeErr, queue.ErrEmpty) {
+							c.errors.Printf("error removing queue entry: %s", removeErr)
+						} else if onEvent := c.cfg.PublishEvents.OnEvent; onEvent != nil {
+							// Queue entries have no attempt history. An earlier attempt (possibly before a restart)
+							// may have transmitted this publication, so its delivery remains unknown.
+							onEvent(session.PublishEvent{Type: session.PublishEventQueueDiscarded, Metadata: metadata, Source: p, Err: err})
 						}
-						// Need a way to notify the user of this
 					} else if errors.Is(err, paho.ErrNetworkErrorAfterStored) { // Message in session so remove from queue
 						if err := entry.Remove(); err != nil {
 							c.errors.Printf("error removing queue entry: %s", err)

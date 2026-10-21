@@ -22,6 +22,7 @@ import (
 	"sync"
 
 	"github.com/eclipse/paho.golang/autopaho/queue"
+	"github.com/eclipse/paho.golang/paho/store"
 )
 
 // A queue implementation that stores all data in RAM
@@ -29,9 +30,14 @@ import (
 // Queue - basic memory based queue
 type Queue struct {
 	mu              sync.Mutex
-	messages        [][]byte
+	messages        []message
 	waiting         []chan<- struct{} // closed when something arrives in the queue
 	waitingForEmpty []chan<- struct{} // closed when queue is empty
+}
+
+type message struct {
+	packet   []byte
+	metadata store.Metadata
 }
 
 // New creates a new memory-based queue
@@ -68,7 +74,10 @@ func (q *Queue) WaitForEmpty() chan struct{} {
 }
 
 // Enqueue add item to the queue.
-func (q *Queue) Enqueue(p io.Reader) error {
+func (q *Queue) Enqueue(p io.Reader, metadata store.Metadata) error {
+	if err := metadata.Validate(); err != nil {
+		return err
+	}
 	var b bytes.Buffer
 	_, err := b.ReadFrom(p)
 	if err != nil {
@@ -76,7 +85,7 @@ func (q *Queue) Enqueue(p io.Reader) error {
 	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	q.messages = append(q.messages, b.Bytes())
+	q.messages = append(q.messages, message{packet: b.Bytes(), metadata: metadata})
 	for _, c := range q.waiting {
 		close(c)
 	}
@@ -103,7 +112,17 @@ func (q *Queue) Reader() (io.Reader, error) {
 	if len(q.messages) == 0 {
 		return nil, queue.ErrEmpty
 	}
-	return bytes.NewReader(q.messages[0]), nil
+	return bytes.NewReader(q.messages[0].packet), nil
+}
+
+// Metadata returns a copy of the first entry's local metadata.
+func (q *Queue) Metadata() (store.Metadata, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if len(q.messages) == 0 {
+		return store.Metadata{}, queue.ErrEmpty
+	}
+	return q.messages[0].metadata, nil
 }
 
 // Leave implements Entry.Leave - the entry (will be returned on subsequent calls to Peek)

@@ -20,10 +20,13 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/eclipse/paho.golang/autopaho/queue"
+	"github.com/eclipse/paho.golang/internal/persistence"
+	"github.com/eclipse/paho.golang/paho/store"
 )
 
 // A queue implementation that stores all data on disk
@@ -122,10 +125,13 @@ func (q *Queue) WaitForEmpty() chan struct{} {
 }
 
 // Enqueue add item to the queue.
-func (q *Queue) Enqueue(p io.Reader) error {
+func (q *Queue) Enqueue(p io.Reader, metadata store.Metadata) error {
+	if err := metadata.Validate(); err != nil {
+		return err
+	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	err := q.put(p)
+	err := q.put(p, metadata)
 	if err == nil && q.queueEmpty {
 		q.queueEmpty = false
 		for _, c := range q.waiting {
@@ -156,10 +162,15 @@ func (q *Queue) Peek() (queue.Entry, error) {
 }
 
 // put writes out an item to disk
-func (q *Queue) put(p io.Reader) error {
+func (q *Queue) put(p io.Reader, metadata store.Metadata) error {
 	// Use CreateTemp to generate a file with a unique name (it will be removed when packet has been transmitted)
-	f, err := os.CreateTemp(q.path, q.prefix+"*"+q.extension)
+	f, err := os.CreateTemp(q.path, q.prefix+"*"+q.extension+".tmp")
 	if err != nil {
+		return err
+	}
+	if err = persistence.WriteHeader(f, metadata); err != nil {
+		f.Close()
+		_ = os.Remove(f.Name())
 		return err
 	}
 
@@ -168,8 +179,17 @@ func (q *Queue) put(p io.Reader) error {
 		_ = os.Remove(f.Name()) // Attempt to remove the partial file (not much we can do if this fails)
 		return err
 	}
+	if err = f.Sync(); err != nil {
+		f.Close()
+		_ = os.Remove(f.Name())
+		return err
+	}
 	if err = f.Close(); err != nil {
 		_ = os.Remove(f.Name()) // Attempt to remove the partial file (not much we can do if this fails)
+		return err
+	}
+	if err = os.Rename(f.Name(), strings.TrimSuffix(f.Name(), ".tmp")); err != nil {
+		_ = os.Remove(f.Name())
 		return err
 	}
 	return nil
@@ -177,16 +197,16 @@ func (q *Queue) put(p io.Reader) error {
 
 // get() returns a ReadCloser that accesses the oldest file available
 // caller must hold lock on mu
-func (q *Queue) get() (entry, error) {
+func (q *Queue) get() (*entry, error) {
 	fn, err := q.oldestEntry()
 	if err != nil {
-		return entry{}, err
+		return nil, err
 	}
 	f, err := os.Open(fn)
 	if err != nil {
-		return entry{}, err
+		return nil, err
 	}
-	return entry{f: f}, nil
+	return &entry{f: f}, nil
 }
 
 // oldestEntry returns the filename of the oldest entry in the queue (if any - io.EOF means none)
@@ -205,6 +225,9 @@ func (q *Queue) oldestEntry() (string, error) {
 			continue
 		}
 		fn := entry.Name()
+		if strings.HasSuffix(fn, q.extension+".tmp") || strings.HasSuffix(fn, q.extension+corruptExtension) {
+			continue
+		}
 		if match, err := filepath.Match(q.prefix+"*"+q.extension, fn); err != nil {
 			return "", fmt.Errorf("failed to read match %s: %w", fn, err)
 		} else if !match {
@@ -229,12 +252,30 @@ func (q *Queue) oldestEntry() (string, error) {
 
 // entry is used to return a queue entry from Peek
 type entry struct {
-	f *os.File
+	f        *os.File
+	loaded   bool
+	metadata store.Metadata
+	reader   io.Reader
+	err      error
+}
+
+func (e *entry) load() {
+	if !e.loaded {
+		e.metadata, e.reader, e.err = persistence.ReadHeader(e.f)
+		e.loaded = true
+	}
+}
+
+// Metadata reads the prefix once and retains its values for this entry's lifetime.
+func (e *entry) Metadata() (store.Metadata, error) {
+	e.load()
+	return e.metadata, e.err
 }
 
 // Reader provides access to the file contents
-func (e entry) Reader() (io.Reader, error) {
-	return e.f, nil
+func (e *entry) Reader() (io.Reader, error) {
+	e.load()
+	return e.reader, e.err
 }
 
 // Leave closes the entry leaving it in the queue (will be returned on subsequent calls to Peek)

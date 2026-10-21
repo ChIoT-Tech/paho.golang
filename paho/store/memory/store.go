@@ -23,6 +23,7 @@ import (
 	"sync"
 
 	"github.com/eclipse/paho.golang/packets"
+	"github.com/eclipse/paho.golang/paho/store"
 )
 
 var (
@@ -31,8 +32,9 @@ var (
 
 // memoryPacket is an element in the memory store
 type memoryPacket struct {
-	c int    // message count (used for ordering; as this is 32 bit min chance of rolling over seems remote)
-	p []byte // the packet we are storing
+	c        int    // message count (used for ordering; as this is 32 bit min chance of rolling over seems remote)
+	p        []byte // the packet we are storing
+	metadata store.Metadata
 }
 
 // New creates a Store
@@ -52,22 +54,37 @@ type Store struct {
 }
 
 // Put stores the packet
-func (m *Store) Put(packetID uint16, packetType byte, w io.WriterTo) error {
+func (m *Store) Put(packetID uint16, packetType byte, w io.WriterTo, metadata store.Metadata) error {
 	m.Lock()
 	defer m.Unlock()
+	if err := metadata.Validate(); err != nil {
+		return err
+	}
 	var buff bytes.Buffer
 
 	_, err := w.WriteTo(&buff)
 	if err != nil {
-		panic(err)
+		return err
 	}
 
 	m.data[packetID] = memoryPacket{
-		c: m.c,
-		p: buff.Bytes(),
+		c:        m.c,
+		p:        buff.Bytes(),
+		metadata: metadata,
 	}
 	m.c++
 	return nil
+}
+
+// GetMetadata retrieves the publication metadata without copying its packet.
+func (m *Store) GetMetadata(packetID uint16) (store.Metadata, error) {
+	m.Lock()
+	defer m.Unlock()
+	d, ok := m.data[packetID]
+	if !ok {
+		return store.Metadata{}, ErrNotInStore
+	}
+	return d.metadata, nil
 }
 
 func (m *Store) Get(packetID uint16) (io.ReadCloser, error) {

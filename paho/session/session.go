@@ -22,6 +22,7 @@ import (
 
 	"github.com/eclipse/paho.golang/packets"
 	paholog "github.com/eclipse/paho.golang/paho/log"
+	"github.com/eclipse/paho.golang/paho/store"
 )
 
 // The session state includes:
@@ -42,7 +43,13 @@ type Packet interface {
 
 // SessionManager will manage the mqtt session state; note that the state may outlast a single `Client` instance
 type SessionManager interface {
-	// ConAckReceived must be called when a CONNACK has been received (with no error). If an error is returned
+	// SetPublishEventHandler configures outgoing publication hooks and notifications. Call before connecting.
+	// Implementations must honor the rules set out in the definition of PublishEventHandler. The client applies
+	// PrepareSend to initial PUBLISH writes; the session manager must apply it to retransmissions and outgoing PUBREL
+	// writes.
+	SetPublishEventHandler(PublishEventHandler)
+
+	// ConAckReceived must be called when a CONNACK has been received (with no error). If an error is returned,
 	// then the connection will be dropped.
 	ConAckReceived(io.Writer, *packets.Connect, *packets.Connack) error
 
@@ -67,7 +74,10 @@ type SessionManager interface {
 	// ReasonCode >= 0x80 indicating rejection. A successful PUBREC (ReasonCode < 0x80) MUST NOT be sent to this channel:
 	// the session manager must handle the PUBREL/PUBCOMP exchange and wait for PUBCOMP before reporting completion.
 	// For SUBSCRIBE and UNSUBSCRIBE, the final acknowledgements are SUBACK and UNSUBACK respectively.
-	AddToSession(ctx context.Context, packet Packet) (<-chan packets.ControlPacket, error)
+	// metadata is local and must be persisted atomically with a PUBLISH, retained
+	// when it becomes PUBREL, and restored after a restart. Use zero metadata for
+	// other packet types. It is never encoded in the MQTT packet itself.
+	AddToSession(ctx context.Context, packet Packet, metadata store.Metadata) (<-chan packets.ControlPacket, error)
 
 	// PacketReceived must be called when any packet with a packet identifier is received. It will make any required
 	// response and pass any `PUBLISH` messages that need to be passed to the user via the channel.

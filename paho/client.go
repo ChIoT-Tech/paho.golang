@@ -29,6 +29,7 @@ import (
 	"github.com/eclipse/paho.golang/paho/log"
 	"github.com/eclipse/paho.golang/paho/session"
 	"github.com/eclipse/paho.golang/paho/session/state"
+	"github.com/eclipse/paho.golang/paho/store"
 )
 
 const defaultSendAckInterval = 50 * time.Millisecond
@@ -97,12 +98,13 @@ type (
 		// OnClientError is for example called on net.Error. Note that this may be called multiple times and may be
 		// called following a successful `Disconnect`. See autopaho.errorHandler for an example.
 		OnClientError func(error)
-		// PublishHook allows a user provided function to be called before
-		// a Publish packet is sent allowing it to inspect or modify the
-		// Publish, an example of the utility of this is provided in the
-		// Topic Alias Handler extension which will automatically assign
-		// and use topic alias values rather than topic strings.
+		// PublishHook allows inspection or modification of an outgoing Publish. For QoS 1/2 messages, it runs before
+		// the message is added to the session state, so modifications are persisted. It is not called when stored
+		// messages are retransmitted after reconnection.
 		PublishHook func(*Publish)
+		// PublishEvents is used to provide functions that will be called at key points during the transmission of
+		// outgoing publications, optionally loading their stored packets, and packet changes.
+		PublishEvents session.PublishEventHandler
 		// EnableManualAcknowledgment is used to control the acknowledgment of packets manually.
 		// BEWARE that the MQTT specs require clients to send acknowledgments in the order in which the corresponding
 		// PUBLISH packets were received.
@@ -193,6 +195,7 @@ func NewClient(conf ClientConfig) *Client {
 		c.config.Session = state.NewInMemory()
 		c.config.autoCloseSession = true // We created `Session`, so need to close it when done (so handlers all return)
 	}
+	c.config.Session.SetPublishEventHandler(c.config.PublishEvents)
 	if c.config.PacketTimeout == 0 {
 		c.config.PacketTimeout = 10 * time.Second
 	}
@@ -757,7 +760,7 @@ func (c *Client) Subscribe(ctx context.Context, s *Subscribe) (*Suback, error) {
 	c.debug.Printf("subscribing to %+v", s.Subscriptions)
 
 	sp := s.Packet()
-	ret, err := c.config.Session.AddToSession(ctx, sp)
+	ret, err := c.config.Session.AddToSession(ctx, sp, store.Metadata{})
 	if err != nil {
 		return nil, err
 	}
@@ -822,7 +825,7 @@ func (c *Client) Subscribe(ctx context.Context, s *Subscribe) (*Suback, error) {
 func (c *Client) Unsubscribe(ctx context.Context, u *Unsubscribe) (*Unsuback, error) {
 	c.debug.Printf("unsubscribing from %+v", u.Topics)
 	up := u.Packet()
-	ret, err := c.config.Session.AddToSession(ctx, up)
+	ret, err := c.config.Session.AddToSession(ctx, up, store.Metadata{})
 	if err != nil {
 		return nil, err
 	}
@@ -937,36 +940,40 @@ func (c *Client) PublishWithOptions(ctx context.Context, p *Publish, o PublishOp
 	c.debug.Printf("sending message to %s", p.Topic)
 
 	pb := p.Packet()
+	metadata := store.Metadata{ID: p.TrackingID, QoS: pb.QoS}
+	if err := metadata.Validate(); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidArguments, err)
+	}
 
 	switch p.QoS {
 	case 0:
 		c.debug.Println("sending QoS0 message")
-		if _, err := pb.WriteTo(c.config.Conn); err != nil {
+		if _, err := c.config.PublishEvents.PrepareSend(pb.ToControlPacket(), metadata).WriteTo(c.config.Conn); err != nil {
 			c.reportError(err)
 			return nil, err
 		}
 		c.config.PingHandler.PacketSent()
 		return &PublishResponse{}, nil
 	case 1, 2:
-		return c.publishQoS12(ctx, pb, o)
+		return c.publishQoS12(ctx, pb, o, metadata)
 	}
 
 	return nil, fmt.Errorf("%w: QoS isn't 0, 1 or 2", ErrInvalidArguments)
 }
 
-func (c *Client) publishQoS12(ctx context.Context, pb *packets.Publish, o PublishOptions) (*PublishResponse, error) {
+func (c *Client) publishQoS12(ctx context.Context, pb *packets.Publish, o PublishOptions, metadata store.Metadata) (*PublishResponse, error) {
 	c.debug.Println("sending QoS12 message")
 	pubCtx, cf := context.WithTimeout(ctx, c.config.PacketTimeout)
 	defer cf()
 
-	ret, err := c.config.Session.AddToSession(pubCtx, pb)
+	ret, err := c.config.Session.AddToSession(pubCtx, pb, metadata)
 	if err != nil {
 		return nil, err
 	}
 
 	// From this point on the message is in store, and ret will receive something regardless of whether we succeed in
-	// writing the packet to the connection
-	if _, err := pb.WriteTo(c.config.Conn); err != nil {
+	// writing the packet to the connection or not.
+	if _, err := c.config.PublishEvents.PrepareSend(pb.ToControlPacket(), metadata).WriteTo(c.config.Conn); err != nil {
 		c.debug.Printf("failed to write packet %d to connection: %s", pb.PacketID, err)
 		if o.Method == PublishMethod_AsyncSend {
 			return nil, ErrNetworkErrorAfterStored // Async send, so we don't wait for the response (may add callbacks in the future to enable user to obtain status)

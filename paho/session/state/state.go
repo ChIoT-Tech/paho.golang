@@ -26,6 +26,7 @@ import (
 	"github.com/eclipse/paho.golang/packets"
 	paholog "github.com/eclipse/paho.golang/paho/log"
 	"github.com/eclipse/paho.golang/paho/session"
+	"github.com/eclipse/paho.golang/paho/store"
 	"github.com/eclipse/paho.golang/paho/store/memory"
 )
 
@@ -76,7 +77,9 @@ const (
 type (
 	// clientGenerated holds information on client-generated packets (e.g. an outgoing SUBSCRIBE request)
 	clientGenerated struct {
-		packetType byte // The type of the last packet sent (i.e. PUBLISH, SUBSCRIBE or UNSUBSCRIBE) - 0 means unknown until loaded from the store
+		packetType     byte // The type of the last packet sent (i.e. PUBLISH, SUBSCRIBE or UNSUBSCRIBE) - 0 means unknown until loaded from the store
+		metadata       store.Metadata
+		metadataLoaded bool // Also true for a known untracked publication.
 
 		// When a message is fully acknowledged, we need to let the requester know by sending the final response to this
 		// channel. One and only one message will be sent (and the channel closed).
@@ -111,6 +114,9 @@ type State struct {
 	// The number of messages in flight needs to be limited, as per receive maximum received from the server.
 	inflight *sendQuota
 
+	publishEvents   session.PublishEventHandler
+	sessionLossDone chan struct{} // Non-nil while discarded packets are being reported and the stores reset
+
 	debug  paholog.Logger
 	errors paholog.Logger
 }
@@ -133,6 +139,27 @@ func NewInMemory() *State {
 		debug:       paholog.NOOPLogger{},
 		errors:      paholog.NOOPLogger{},
 	}
+}
+
+// SetPublishEventHandler configures outgoing publish events. Clients call this before connecting.
+// If using State directly, also apply handler.PrepareSend to the initial PUBLISH, after AddToSession and before
+// writing to the connection.
+func (s *State) SetPublishEventHandler(handler session.PublishEventHandler) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.publishEvents = handler
+}
+
+// SetDebugLogger takes an instance of the paho Logger interface
+// and sets it to be used by the debug log endpoint
+func (s *State) SetDebugLogger(l paholog.Logger) {
+	s.debug = l
+}
+
+// SetErrorLogger takes an instance of the paho Logger interface
+// and sets it to be used by the error log endpoint
+func (s *State) SetErrorLogger(l paholog.Logger) {
+	s.errors = l
 }
 
 // Close closes the session state
@@ -172,6 +199,7 @@ func (s *State) conAckReceived(conn io.Writer, cp *packets.Connect, ca *packets.
 	// after the specified time period (if the Session Expiry Interval is absent the value in the CONNECT Packet used)
 	// however, this is not something the generic client can really achieve (forks may wish to do this!).
 	var removed []clientGenerated
+	s.waitForSessionLossLocked()
 	if err := s.resetPendingStores(); err != nil {
 		return nil, fmt.Errorf("failed to complete pending session cleanup: %w", err)
 	}
@@ -183,9 +211,6 @@ func (s *State) conAckReceived(conn io.Writer, cp *packets.Connect, ca *packets.
 			return removed, fmt.Errorf("failed to clean up previous connection: %w", err)
 		}
 	}
-	s.conn = conn
-	s.connCtx, s.connCtxCancel = context.WithCancel(context.Background())
-
 	// If the Server accepts a connection with Clean Start set to 1, the Server MUST set Session Present to 0 in the
 	// CONNACK packet in addition to setting a 0x00 (Success) Reason Code in the CONNACK packet [MQTT-3.2.2-2].
 	// If the Server accepts a connection with Clean Start set to 0 and the Server has Session State for the ClientID,
@@ -193,12 +218,16 @@ func (s *State) conAckReceived(conn io.Writer, cp *packets.Connect, ca *packets.
 	// packet. In both cases, it MUST set a 0x00 (Success) Reason Code in the CONNACK packet [MQTT-3.2.2-3].
 	if !ca.SessionPresent {
 		s.debug.Println("no session present - cleaning session state")
-		cleaned, err := s.clean()
+		cleaned, err := s.clean(&packets.ControlPacket{FixedHeader: packets.FixedHeader{Type: packets.CONNACK}, Content: ca})
 		removed = append(removed, cleaned...)
 		if err != nil {
 			return removed, fmt.Errorf("failed to clean session state: %w", err)
 		}
 	}
+	// Make the connection available only after s.clean has finished reading stored
+	// packets and reporting session loss. Until then, AddToSession must reject new publications.
+	s.conn = conn
+	s.connCtx, s.connCtxCancel = context.WithCancel(context.Background())
 	inFlight := uint16(len(s.clientPackets))
 	s.debug.Printf("%d inflight transactions upon connection", inFlight)
 
@@ -241,6 +270,14 @@ func (s *State) conAckReceived(conn io.Writer, cp *packets.Connect, ca *packets.
 	s.debug.Printf("retransmitting %d messages", len(toResend))
 	for _, id := range toResend {
 		s.debug.Printf("resending message ID %d", id)
+		cg := s.clientPackets[id]
+		if !cg.metadataLoaded {
+			cg.metadata, err = s.clientStore.GetMetadata(id)
+			if err != nil {
+				return removed, fmt.Errorf("loading publication metadata %d: %w", id, err)
+			}
+			cg.metadataLoaded = true
+		}
 		r, err := s.clientStore.Get(id)
 		if err != nil {
 			s.errors.Printf("failed to load packet %d from client store: %s", id, err)
@@ -265,7 +302,9 @@ func (s *State) conAckReceived(conn io.Writer, cp *packets.Connect, ca *packets.
 		case packets.PUBLISH:
 			pub := p.Content.(*packets.Publish)
 			pub.Duplicate = true
+			cg.metadata.QoS = pub.QoS
 		case packets.PUBREL:
+			cg.metadata.QoS = 2
 		default:
 			if err := s.clientStore.Quarantine(id); err != nil {
 				s.errors.Printf("failed to quarantine packet %d from client store: %s", id, err)
@@ -273,25 +312,32 @@ func (s *State) conAckReceived(conn io.Writer, cp *packets.Connect, ca *packets.
 			s.errors.Printf("unexpected packet type %d (for packet identifier %d) in client store", p.Type, id)
 			continue
 		}
+		cg.packetType = p.Type
+		if cg.responseChan == nil {
+			cg.responseChan = make(chan packets.ControlPacket, 1)
+		}
+		// Reserve the identifier and metadata before releasing mu for callbacks.
+		s.clientPackets[id] = cg
 
 		// The messages being retransmitted form part of the "send quota"; however, as per the V5 spec,
 		// the limit does not apply to messages being resent (the quota can go under 0)
 		s.inflight.Retransmit() // This will never block (but is needed to block new messages)
 
 		// Any failure from this point should result in loss of connection (so fatal)
+		if s.publishEvents.BeforeSend != nil {
+			handler, connCtx := s.publishEvents, s.connCtx
+			s.mu.Unlock() // Holding mu whist running application code is likely to cause issues
+			p = handler.PrepareSend(p, cg.metadata)
+			s.mu.Lock()
+			if s.connCtx != connCtx { // indicates connection loss whist handling callbacks
+				return removed, session.ErrNoConnection
+			}
+		}
 		if _, err := p.WriteTo(conn); err != nil {
 			s.debug.Printf("retransmitting of identifier %d failed: %s", id, err)
 			return removed, fmt.Errorf("failed to retransmit message (%d): %w", id, err)
 		}
 		s.debug.Printf("retransmitted message with identifier %d", id)
-		// On initial connection, the packet needs to be added to our record of client-generated packets.
-		if _, ok := s.clientPackets[id]; !ok {
-			response := make(chan packets.ControlPacket, 1)
-			s.clientPackets[id] = clientGenerated{
-				packetType:   p.Type,
-				responseChan: response, // Nothing will wait on this
-			}
-		}
 	}
 	return removed, nil
 }
@@ -353,6 +399,7 @@ func (s *State) ConnectionLost(dp *packets.Disconnect) error {
 // connectionLost process loss of connection
 // Caller MUST have locked c.Mu
 func (s *State) connectionLost(dp *packets.Disconnect) ([]clientGenerated, error) {
+	s.waitForSessionLossLocked()
 	if s.conn == nil {
 		// ConnectionLost may be called multiple times. A later call is also an opportunity to finish a store reset that
 		// failed while the connection was being torn down.
@@ -367,7 +414,11 @@ func (s *State) connectionLost(dp *packets.Disconnect) ([]clientGenerated, error
 	// Interval is greater than 0 [MQTT-3.1.2-23]
 	if s.sessionExpiryInterval == 0 {
 		s.debug.Println("sessionExpiryInterval is 0 and connection lost - cleaning session state")
-		return s.clean()
+		var trigger *packets.ControlPacket
+		if dp != nil {
+			trigger = &packets.ControlPacket{FixedHeader: packets.FixedHeader{Type: packets.DISCONNECT}, Content: dp}
+		}
+		return s.clean(trigger)
 	}
 	return s.tidy(), nil
 }
@@ -395,15 +446,24 @@ func (s *State) clearConnection() {
 //
 // If the function returns an error, the response channel will be nil and any actions taken will be rewound prior to
 // return.
-func (s *State) AddToSession(ctx context.Context, packet session.Packet) (<-chan packets.ControlPacket, error) {
+func (s *State) AddToSession(ctx context.Context, packet session.Packet, metadata store.Metadata) (<-chan packets.ControlPacket, error) {
+	if p, ok := packet.(*packets.Publish); ok {
+		if p.QoS > 2 {
+			return nil, fmt.Errorf("invalid publication QoS %d", p.QoS)
+		}
+		metadata.QoS = p.QoS
+	}
+	if err := metadata.Validate(); err != nil {
+		return nil, err
+	}
 	response := make(chan packets.ControlPacket, 1)
-	if err := s.addToSession(ctx, packet, response); err != nil {
+	if err := s.addToSession(ctx, packet, response, metadata); err != nil {
 		return nil, err
 	}
 	return response, nil
 }
 
-func (s *State) addToSession(ctx context.Context, packet session.Packet, response chan<- packets.ControlPacket) error {
+func (s *State) addToSession(ctx context.Context, packet session.Packet, response chan<- packets.ControlPacket, metadata store.Metadata) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	s.mu.Lock() // There may be a delay waiting for semaphore, so check for connection before and after
@@ -467,7 +527,7 @@ func (s *State) addToSession(ctx context.Context, packet session.Packet, respons
 	}
 	packet.SetIdentifier(packetID)
 	if pt == packets.PUBLISH {
-		if err = s.clientStore.Put(packetID, pt, packet); err != nil {
+		if err = s.clientStore.Put(packetID, pt, packet, metadata); err != nil {
 			delete(s.clientPackets, packetID)
 			s.mu.Unlock()
 			if qErr := inflight.Release(); qErr != nil {
@@ -476,6 +536,9 @@ func (s *State) addToSession(ctx context.Context, packet session.Packet, respons
 			packet.SetIdentifier(0) // ensure the Message identifier is not used
 			return err
 		}
+		cg := s.clientPackets[packetID]
+		cg.metadata, cg.metadataLoaded = metadata, true
+		s.clientPackets[packetID] = cg
 	}
 	s.mu.Unlock()
 	return nil
@@ -485,8 +548,13 @@ func (s *State) addToSession(ctx context.Context, packet session.Packet, respons
 // (or if, due to connection loss, it will never be acknowledged).
 func (s *State) endClientGenerated(packetID uint16, recv *packets.ControlPacket) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	handler := s.publishEvents
+	var event *session.PublishEvent
 	if cg, ok := s.clientPackets[packetID]; ok {
+		if handler.OnEvent != nil && (cg.packetType == packets.PUBLISH || cg.packetType == packets.PUBREL) {
+			e := s.publishEventLocked(handler, session.PublishEventComplete, packetID, recv, cg)
+			event = &e
+		}
 		complete(cg, *recv)
 		delete(s.clientPackets, packetID)
 		// Outgoing publish messages will be in the store (replaced with PUBREL that is sent)
@@ -498,10 +566,17 @@ func (s *State) endClientGenerated(packetID uint16, recv *packets.ControlPacket)
 			}
 			if err := s.clientStore.Delete(packetID); err != nil {
 				s.errors.Printf("failed to remove message %d from store: %s", packetID, err)
+				if event != nil {
+					event.Err = errors.Join(event.Err, err)
+				}
 			}
 		}
 	} else {
 		s.debug.Println("received a response for a message ID we don't know:", recv.PacketID())
+	}
+	s.mu.Unlock()
+	if event != nil {
+		handler.OnEvent(*event)
 	}
 	return nil // TODO: Should we return errors here (not much that could be done with them)
 }
@@ -561,7 +636,7 @@ func (s *State) ack(pb *packets.Publish) error {
 		// We need to record the fact that a PUBREC has been sent so we can detect receipt of a duplicate `PUBLISH`
 		// (which should not be passed to the client app)
 		cp := pr.ToControlPacket()
-		s.serverStore.Put(pb.PacketID, packets.PUBREC, cp)
+		s.serverStore.Put(pb.PacketID, packets.PUBREC, cp, store.Metadata{})
 		s.serverPackets[pb.PacketID] = cp.Type
 	default:
 		err = errors.New("ack called but publish not QOS 1 or 2")
@@ -592,56 +667,7 @@ func (s *State) PacketReceived(recv *packets.ControlPacket, pubChan chan<- *pack
 		s.endClientGenerated(rp.PacketID, recv)
 		return nil
 	case *packets.Pubrec: // Initial response to a QOS2 Publish
-		s.debug.Println("received PUBREC packet with id ", rp.PacketID)
-		s.mu.Lock()
-		cg, ok := s.clientPackets[rp.PacketID]
-		validTransaction := ok && (cg.packetType == packets.PUBLISH || cg.packetType == packets.PUBREL)
-		conn := s.conn
-		var storeErr error
-		if validTransaction && rp.ReasonCode < 0x80 {
-			pl := packets.Pubrel{PacketID: rp.PacketID}
-			storeErr = s.clientStore.Put(rp.PacketID, packets.PUBREL, &pl)
-			if storeErr == nil {
-				cg.packetType = packets.PUBREL
-				s.clientPackets[rp.PacketID] = cg
-			}
-		}
-		s.mu.Unlock()
-		if !validTransaction {
-			pl := packets.Pubrel{ // Respond with "Packet Identifier not found"
-				PacketID:   recv.Content.(*packets.Pubrec).PacketID,
-				ReasonCode: 0x92,
-			}
-			s.debug.Println("sending PUBREL (unknown ID) for ", pl.PacketID)
-			if conn == nil {
-				return session.ErrNoConnection
-			}
-			if _, err := pl.WriteTo(conn); err != nil {
-				s.errors.Printf("failed to send PUBREL for %d: %s", pl.PacketID, err)
-				return err
-			}
-		} else {
-			if rp.ReasonCode >= 0x80 {
-				s.endClientGenerated(rp.PacketID, recv)
-			} else {
-				pl := packets.Pubrel{
-					PacketID: rp.PacketID,
-				}
-				s.debug.Println("sending PUBREL for", rp.PacketID)
-				if storeErr != nil {
-					s.errors.Printf("failed to write PUBREL to store for %d: %s", rp.PacketID, storeErr)
-					return storeErr
-				}
-				if conn == nil {
-					return session.ErrNoConnection
-				}
-				if _, err := pl.WriteTo(conn); err != nil {
-					s.errors.Printf("failed to send PUBREL for %d: %s", rp.PacketID, err)
-					return err
-				}
-			}
-		}
-		return nil
+		return s.pubrecReceived(recv)
 	case *packets.Pubcomp: // QOS 2 final response
 		s.debug.Printf("received PUBCOMP packet with id %d", rp.PacketID)
 		s.endClientGenerated(rp.PacketID, recv)
@@ -767,25 +793,72 @@ func (s *State) allocateNextPacketIdLocked(forPacketType byte, response chan<- p
 	return 0, session.ErrPacketIdentifiersExhausted
 }
 
-// clean deletes any existing stored session information (returning the client packets removed)
-// does not touch inflight because this is not part of the session state (so is reset separately)
-// caller is responsible for locking s.mu
-func (s *State) clean() ([]clientGenerated, error) {
+// clean clears the session state and invokes any configured session-loss callbacks.
+// Returned transactions must be passed to notifyRemoved to unblock their waiting callers.
+// Does not touch inflight because this is not part of the session state (so is reset separately)
+// caller is responsible for locking s.mu and making the connection unavailable.
+// mu is temporarily released for callbacks; other connection transitions must wait for sessionLossDone before accessing
+// the stores.
+func (s *State) clean(trigger *packets.ControlPacket) ([]clientGenerated, error) {
 	s.debug.Println("State.clean() called")
+
+	// If there is an OnEvent handler we will need to notify it of transactions removed from the state
+	handler := s.publishEvents
+	var ids []uint16
+	var listErr error
+	if handler.OnEvent != nil {
+		// The callback needs to be called with the
+		ids, listErr = s.sessionLostPacketIDsLocked()
+		s.sessionLossDone = make(chan struct{})
+		defer func() {
+			close(s.sessionLossDone)
+			s.sessionLossDone = nil
+		}()
+	}
 	removed := make([]clientGenerated, 0, len(s.clientPackets))
+	previous := s.clientPackets
 	for _, p := range s.clientPackets {
 		removed = append(removed, p)
 	}
 	s.serverPackets = make(map[uint16]byte)
 	s.clientPackets = make(map[uint16]clientGenerated)
 
-	// It's important that the stores are reset before another connection is accepted (otherwise we
-	// may transmit data we should not). As such we signal that this is needed and it's done at the
-	// start of `conAckReceived`. Note that it's possible that this info is lost across an application
-	// restart, but addressing that would require additional persistence (and is fairly unlikely).
+	// Mark both stores for reset. Cleanup is attempted below; any failed reset must succeed before a subsequent
+	// connection can reuse the stores. These flags are not persisted. If the process exits before cleanup succeeds,
+	// a new State will have no record that the remaining stored packets must be discarded.
 	s.serverStoreResetPending = true
 	s.clientStoreResetPending = true
-	return removed, s.resetPendingStores()
+
+	// Notify the handler of removed transactions
+	if handler.OnEvent != nil {
+		// As with other completion events, release blocked callers before invoking
+		// application callbacks. The cleanup gate protects the stores while mu is free.
+		s.mu.Unlock()
+		notifyRemoved(removed)
+		s.mu.Lock()
+		removed = nil
+		if listErr != nil {
+			s.notifyPublishEventLocked(handler, session.PublishEvent{
+				Type: session.PublishEventSessionLost, Trigger: trigger,
+				Err: fmt.Errorf("listing discarded publications: %w", listErr),
+			})
+		}
+		for _, id := range ids {
+			event := s.publishEventLocked(handler, session.PublishEventSessionLost, id, trigger, previous[id])
+			s.notifyPublishEventLocked(handler, event)
+		}
+	}
+
+	// complete cleanup
+	err := s.resetPendingStores()
+	if err != nil && handler.OnEvent != nil {
+		// Earlier events have already been delivered, so report a the reset failure separately instead of retaining
+		// the source packets.
+		s.notifyPublishEventLocked(handler, session.PublishEvent{
+			Type: session.PublishEventSessionLost, Trigger: trigger, Err: err,
+		})
+	}
+	return removed, err
 }
 
 // resetPendingStores completes any store cleanup required by a prior connection state change. A store remains
@@ -849,16 +922,173 @@ func (s *State) tidy() []clientGenerated {
 	return removed
 }
 
-// SetDebugLogger takes an instance of the paho Logger interface
-// and sets it to be used by the debug log endpoint
-func (s *State) SetDebugLogger(l paholog.Logger) {
-	s.debug = l
+// publishEventLocked creates a PublishEvent for packetID. When requested, it loads the stored packet into Source,
+// recording any error in Err. Header mode currently uses the full decoder; callers must not rely on the payload.
+// The caller must hold s.mu.
+func (s *State) publishEventLocked(handler session.PublishEventHandler, kind session.PublishEventType, id uint16, trigger *packets.ControlPacket, cg clientGenerated) session.PublishEvent {
+	e := session.PublishEvent{Type: kind, PacketID: id, Trigger: trigger}
+	if cg.metadataLoaded {
+		e.Metadata = cg.metadata
+	} else {
+		metadata, err := s.clientStore.GetMetadata(id)
+		if err != nil {
+			e.Err = fmt.Errorf("loading publish event metadata %d: %w", id, err)
+		} else {
+			e.Metadata = metadata
+		}
+	}
+	if handler.ReadStoredPacket == session.ReadStoredNone {
+		return e
+	}
+	r, err := s.clientStore.Get(id)
+	if err != nil {
+		e.Err = errors.Join(e.Err, fmt.Errorf("loading publish event source %d: %w", id, err))
+		return e
+	}
+	p, readErr := packets.ReadPacket(r)
+	if err = errors.Join(readErr, r.Close()); err != nil {
+		e.Err = errors.Join(e.Err, fmt.Errorf("reading publish event source %d: %w", id, err))
+		return e
+	}
+	if (p.Type != packets.PUBLISH && p.Type != packets.PUBREL) || p.PacketID() != id {
+		e.Err = errors.Join(e.Err, fmt.Errorf("unexpected stored packet for publish event %d: %s (id %d)", id, p.PacketType(), p.PacketID()))
+		return e
+	}
+	e.Source = p
+	return e
 }
 
-// SetErrorLogger takes an instance of the paho Logger interface
-// and sets it to be used by the error log endpoint
-func (s *State) SetErrorLogger(l paholog.Logger) {
-	s.errors = l
+// sessionLostPacketIDsLocked returns packet IDs for session-loss notifications.
+// It combines IDs from clientStore and outgoing PUBLISH/PUBREL entries in clientPackets, without duplicates.
+// Any store listing error is also returned. The caller must hold s.mu.
+func (s *State) sessionLostPacketIDsLocked() ([]uint16, error) {
+	ids, err := s.clientStore.List()
+	seen := make(map[uint16]bool, len(ids))
+	for _, id := range ids {
+		seen[id] = true
+	}
+	for id, cg := range s.clientPackets {
+		if !seen[id] && (cg.packetType == packets.PUBLISH || cg.packetType == packets.PUBREL) {
+			ids = append(ids, id)
+		}
+	}
+	return ids, err
+}
+
+// waitForSessionLossLocked waits for any ongoing session-loss notifications and store cleanup to finish.
+// It releases s.mu while waiting and reacquires it before returning.
+// This must be called before a connection transition accesses or changes session state or its stores.
+// The caller must hold s.mu.
+func (s *State) waitForSessionLossLocked() {
+	for s.sessionLossDone != nil {
+		done := s.sessionLossDone
+		s.mu.Unlock()
+		<-done
+		s.mu.Lock()
+	}
+}
+
+// notifyPublishEventLocked temporarily unlocks s.mu and calls handler.OnEvent. The caller must hold s.mu and ensure
+// the session state remains protected while the callback runs.
+func (s *State) notifyPublishEventLocked(handler session.PublishEventHandler, event session.PublishEvent) {
+	s.mu.Unlock()
+	defer s.mu.Lock()
+	handler.OnEvent(event)
+}
+
+// pubrecReceived handles a PUBREC for an outgoing QoS 2 publication.
+// A rejection completes the transaction. On the first successful PUBREC, it
+// invokes the configured callbacks and stores PUBREL before sending it.
+// Repeated successful PUBRECs resend PUBREL without replacing the stored packet.
+// An unknown packet ID receives PUBREL with reason code 0x92 (Packet Identifier not found).
+func (s *State) pubrecReceived(recv *packets.ControlPacket) error {
+	rp := recv.Content.(*packets.Pubrec)
+	s.mu.Lock()
+	cg, ok := s.clientPackets[rp.PacketID]
+	conn, connCtx := s.conn, s.connCtx
+	handler := s.publishEvents
+	if !ok || (cg.packetType != packets.PUBLISH && cg.packetType != packets.PUBREL) {
+		// either we don't know about this packetID or it's not PUBLISH related (note that we don't currently confirm
+		// that it's a QOS2 transaction). Respond with "Packet Identifier not found"
+		s.mu.Unlock()
+		if conn == nil {
+			return session.ErrNoConnection
+		}
+		outgoing := &packets.ControlPacket{
+			FixedHeader: packets.FixedHeader{Type: packets.PUBREL, Flags: 2},
+			Content:     &packets.Pubrel{PacketID: rp.PacketID, ReasonCode: 0x92},
+		}
+		_, err := handler.PrepareSend(outgoing, store.Metadata{}).WriteTo(conn)
+		return err
+	}
+	// PUBREC reason code >= 0x80 rejects the publication and completes the transaction; no PUBREL is sent.
+	if rp.ReasonCode >= 0x80 {
+		s.mu.Unlock()
+		return s.endClientGenerated(rp.PacketID, recv)
+	}
+
+	pl := &packets.Pubrel{PacketID: rp.PacketID, Properties: &packets.Properties{}}
+	outgoing := &packets.ControlPacket{FixedHeader: packets.FixedHeader{Type: packets.PUBREL, Flags: 2}, Content: pl}
+
+	// We may need to call user function that can edit the outgoing packet
+	prepare := cg.packetType == packets.PUBLISH && handler.PreparePubrel != nil
+	if handler.OnEvent != nil || prepare || cg.packetType == packets.PUBREL {
+		sourceHandler := handler
+		if cg.packetType == packets.PUBREL {
+			// Repeated PUBREC resends the persisted PUBREL, including its properties. This means the stored packet is
+			// needed for the outgoing response below.
+			sourceHandler.ReadStoredPacket = session.ReadStoredFull
+		}
+		event := s.publishEventLocked(sourceHandler, session.PublishEventPubrec, rp.PacketID, recv, cg)
+		if event.Source != nil {
+			source := event.Source
+			if source.Type != cg.packetType {
+				event.Err = fmt.Errorf("stored packet type %d differs from transaction type %d", source.Type, cg.packetType)
+				event.Source = nil
+			} else if cg.packetType == packets.PUBREL {
+				outgoing = source
+			}
+		}
+		if handler.ReadStoredPacket == session.ReadStoredNone {
+			event.Source = nil // Retransmission may require a store read even when callbacks opt out.
+		}
+		s.mu.Unlock()
+		if prepare && event.Err == nil {
+			var source *packets.Publish
+			if event.Source != nil {
+				source = event.Source.Content.(*packets.Publish)
+			}
+			handler.PreparePubrel(session.PubrelPreparation{Source: source, Trigger: rp, Outgoing: pl, Metadata: cg.metadata})
+		}
+		if handler.OnEvent != nil {
+			handler.OnEvent(event)
+		}
+		s.mu.Lock()
+		current, exists := s.clientPackets[rp.PacketID]
+		if s.connCtx != connCtx || !exists || current.responseChan != cg.responseChan || current.packetType != cg.packetType {
+			s.mu.Unlock()
+			return session.ErrNoConnection
+		}
+		if event.Err != nil {
+			s.mu.Unlock()
+			return event.Err
+		}
+	}
+	if cg.packetType == packets.PUBLISH {
+		// MQTT-4.3.3-6 forbids sending PUBLISH again once PUBREL has been sent. Commit PUBREL, before transmitting.
+		if err := s.clientStore.Put(rp.PacketID, packets.PUBREL, outgoing, cg.metadata); err != nil {
+			s.mu.Unlock()
+			return err
+		}
+		cg.packetType = packets.PUBREL
+		s.clientPackets[rp.PacketID] = cg
+	}
+	s.mu.Unlock()
+	if conn == nil {
+		return session.ErrNoConnection
+	}
+	_, err := handler.PrepareSend(outgoing, cg.metadata).WriteTo(conn)
+	return err
 }
 
 // notifyRemoved releases callers whose transactions were discarded during a connection or session transition.

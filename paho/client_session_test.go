@@ -24,6 +24,7 @@ import (
 	"github.com/eclipse/paho.golang/packets"
 	paholog "github.com/eclipse/paho.golang/paho/log"
 	"github.com/eclipse/paho.golang/paho/session"
+	pstore "github.com/eclipse/paho.golang/paho/store"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -34,7 +35,9 @@ type prematurePubrecSession struct {
 	reasonCode byte
 }
 
-func (s *prematurePubrecSession) AddToSession(_ context.Context, packet session.Packet) (<-chan packets.ControlPacket, error) {
+func (*prematurePubrecSession) SetPublishEventHandler(session.PublishEventHandler) {}
+
+func (s *prematurePubrecSession) AddToSession(_ context.Context, packet session.Packet, metadata pstore.Metadata) (<-chan packets.ControlPacket, error) {
 	packet.SetIdentifier(1)
 	response := packets.NewControlPacket(packets.PUBREC)
 	pubrec := response.Content.(*packets.Pubrec)

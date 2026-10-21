@@ -36,6 +36,7 @@ import (
 	"github.com/eclipse/paho.golang/paho"
 	paholog "github.com/eclipse/paho.golang/paho/log"
 	"github.com/eclipse/paho.golang/paho/session/state"
+	pstore "github.com/eclipse/paho.golang/paho/store"
 	memstore "github.com/eclipse/paho.golang/paho/store/memory"
 )
 
@@ -89,7 +90,7 @@ func TestQueuedMessages(t *testing.T) {
 
 		// Add a corrupt item to the queue (zero bytes) - this should be logged and ignored
 		q := memqueue.New()
-		if err := q.Enqueue(bytes.NewReader(nil)); err != nil {
+		if err := q.Enqueue(bytes.NewReader(nil), pstore.Metadata{}); err != nil {
 			t.Fatalf("failed to add corrupt zero byte item to queue")
 		}
 
@@ -103,8 +104,8 @@ func TestQueuedMessages(t *testing.T) {
 		defer session.Close()
 
 		// Add a corrupt item to the store (zero bytes) - this should be logged and ignored
-		clientStore.Put(1, packets.PUBLISH, bytes.NewReader(nil))
-		serverStore.Put(1, packets.PUBREC, bytes.NewReader(nil))
+		clientStore.Put(1, packets.PUBLISH, bytes.NewReader(nil), pstore.Metadata{})
+		serverStore.Put(1, packets.PUBREC, bytes.NewReader(nil), pstore.Metadata{})
 
 		connectCount := 0
 		config := ClientConfig{
@@ -309,7 +310,7 @@ func TestPreloadPublish(t *testing.T) {
 				w.Close()
 			}()
 
-			if err := q.Enqueue(r); err != nil {
+			if err := q.Enqueue(r, pstore.Metadata{}); err != nil {
 				t.Fatalf("failed to enqueue: %s", err)
 			}
 		}

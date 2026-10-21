@@ -24,6 +24,7 @@ import (
 	"github.com/eclipse/paho.golang/internal/testserver"
 	"github.com/eclipse/paho.golang/packets"
 	paholog "github.com/eclipse/paho.golang/paho/log"
+	pstore "github.com/eclipse/paho.golang/paho/store"
 	"github.com/eclipse/paho.golang/paho/store/memory"
 )
 
@@ -41,7 +42,7 @@ func TestLoadExistingSession(t *testing.T) {
 	pcp.Content.(*packets.Publish).QoS = qos
 	pcp.Content.(*packets.Publish).Payload = payload
 
-	if err := cs.Put(cliPacketID, packets.PUBLISH, pcp); err != nil {
+	if err := cs.Put(cliPacketID, packets.PUBLISH, pcp, pstore.Metadata{}); err != nil {
 		t.Fatalf("failed to put: %s", err)
 	}
 
@@ -51,7 +52,7 @@ func TestLoadExistingSession(t *testing.T) {
 	srvPacketID := uint16(12)
 	pcp.Content.(*packets.Pubrec).PacketID = srvPacketID
 
-	if err := ss.Put(srvPacketID, packets.PUBREC, pcp); err != nil {
+	if err := ss.Put(srvPacketID, packets.PUBREC, pcp, pstore.Metadata{}); err != nil {
 		t.Fatalf("failed to put: %s", err)
 	}
 

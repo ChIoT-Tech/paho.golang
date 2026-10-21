@@ -111,9 +111,9 @@ See the [other examples](https://github.com/eclipse/paho.golang/tree/master/auto
 ## QOS 1 & 2
 
 QOS 1 & 2 provide assurances that messages will be delivered. To implement this a [session state](https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901230)
-is required that holds information on messages that have not been fully acknowledged. By default `autopaho` holds this 
-state in memory meaning that messages will not be lost following a reconnection, but may be lost if the program is 
-restarted (a file-based store can be used to avoid this).   
+is required that holds information on messages that have not been fully acknowledged. By default `autopaho` holds this
+state in memory meaning that messages will not be lost following a reconnection, but may be lost if the program is
+restarted (a file-based store can be used to avoid this).
 
 A range of settings impact message delivery; if you want guaranteed delivery, then remember to:
 
@@ -148,13 +148,48 @@ When publishing a message, there are a number of things that can go wrong; for e
 * The application might be restarted (but you still want messages previously published to be delivered)
 * `ConnectionManager.Publish` may timeout because you are attempting to publish a lot of messages in a short space of time.
 
-With MQTT v3.1 this was generally handled by adding messages to the session; meaning they would be retried if the 
+With MQTT v3.1 this was generally handled by adding messages to the session; meaning they would be retried if the
 connection droped and was reestablished. MQTT v5 introduces a [Receive Maximum](https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901083)
 which limits the number of messages that can be in flight (and, hence, in the session).
 
-`ConnectionManager.PublishViaQueue` provides a solution; messages passed to this function are added to a queue and 
+`ConnectionManager.PublishViaQueue` provides a solution; messages passed to this function are added to a queue and
 transmitted when possible. By default, this queue is held in memory but you can use an alternate `ClientConfig.Queue`
 (e.g. `queue/disk`) if you wish the queue to survive an application restart.
 
 See `examples/queue`.
 
+## Outgoing publish events
+
+`paho.ClientConfig.PublishEvents` provides callbacks that allow you to track (and edit) packets relating to outgoing
+publications. These callbacks support delivery tracking and packet customisation.
+
+| Callback | Behaviour |
+| --- | --- |
+| `BeforeSend` | Before each PUBLISH/PUBREL write, including QoS 0 and retransmissions. Allows changes to the packet that is to be transmitted. |
+| `PreparePubrel` | On the first successful PUBREC, before storing PUBREL. Allows properties to be copied into PUBREL. |
+| `OnEvent` | Reports acknowledgements, session loss, and local rejection of queued publications through the notifications below. |
+
+`ReadStoredPacket` allows the user to select the data needed by `PreparePubrel` and `OnEvent` for stored publications:
+
+| Mode | Source data |
+| --- | --- |
+| `session.ReadStoredNone` (0, default) | No stored source; `Source` is nil. |
+| `session.ReadStoredHeader` (1) | Fixed and variable headers, including properties. The payload may also be present, but callbacks must not rely on it. |
+| `session.ReadStoredFull` (2) | Complete packet, including the payload. |
+
+
+Every publication callback also receives local `Metadata` containing its application tracking ID and original QoS.
+This is independent of `ReadStoredPacket`. Set `paho.Publish.TrackingID` before publishing, or use the
+[delivery extension](../paho/extensions/delivery/readme.md) to generate an ID and classify outcomes.
+The queue persists metadata with the packet, then passes it to the session. The ID is never transmitted to the broker.
+Header mode currently uses the full packet decoder; metadata-only tracking does not need that decoder.
+
+| Notification | Trigger | Meaning |
+| --- | --- | --- |
+| `session.PublishEventPubrec` | Successful PUBREC, including repeats | Progress in a QoS 2 exchange. |
+| `session.PublishEventComplete` | PUBACK, rejection PUBREC, or PUBCOMP | The transaction completed; inspect the reason code to determine the outcome. |
+| `session.PublishEventSessionLost` | CONNACK, DISCONNECT, or none | The session was cleared and the publication discarded; delivery is unknown. |
+| `session.PublishEventQueueDiscarded` | None | Local validation rejected the latest attempt, or a corrupt queued packet was quarantined. Earlier attempts may have transmitted it, so delivery is unknown. `Source` contains the queued PUBLISH when readable, `Metadata` identifies the publication when readable, `Err` contains the local error, and `PacketID` is zero. |
+
+See the [delivery extension](../paho/extensions/delivery/readme.md) for examples,
+application-ID tracking, and detailed guidance on outcomes, errors, and persistence.

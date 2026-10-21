@@ -22,8 +22,12 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/eclipse/paho.golang/internal/persistence"
+	"github.com/eclipse/paho.golang/paho/store"
 )
 
 const (
@@ -78,21 +82,33 @@ type Store struct {
 // Put stores the packet
 // The store is performed via a temporary file to reduce the chance that a partially written file will
 // cause issues.
-func (s *Store) Put(packetID uint16, packetType byte, w io.WriterTo) error {
+func (s *Store) Put(packetID uint16, packetType byte, w io.WriterTo, metadata store.Metadata) error {
 	s.Lock()
 	defer s.Unlock()
+	if err := metadata.Validate(); err != nil {
+		return err
+	}
 
 	f, err := os.CreateTemp(s.path, s.fileNamePrefix(packetID)+"-*"+s.extension+tmpExtension)
 	if err != nil {
 		return fmt.Errorf("failed to create temp file: %w", err)
 	}
 	tmpFn := f.Name()
+	if err = persistence.WriteHeader(f, metadata); err != nil {
+		f.Close()
+		_ = os.Remove(tmpFn)
+		return fmt.Errorf("failed to write metadata to temp file: %w", err)
+	}
 	if _, err = w.WriteTo(f); err != nil {
 		f.Close()
 		_ = os.Remove(tmpFn)
 		return fmt.Errorf("failed to write packet to temp file: %w", err)
 	}
-	f.Sync() // want timestamps to be as accurate as possible (close and rename do not imply sync)
+	if err = f.Sync(); err != nil {
+		f.Close()
+		_ = os.Remove(tmpFn)
+		return fmt.Errorf("failed to sync temp file: %w", err)
+	}
 	if err = f.Close(); err != nil {
 		_ = os.Remove(tmpFn)
 		return fmt.Errorf("failed to close temp file: %w", err)
@@ -113,7 +129,33 @@ func (s *Store) Get(packetID uint16) (io.ReadCloser, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to open packet file: %w", err)
 	}
-	return f, nil
+	_, reader, err := persistence.ReadHeader(f)
+	if err != nil {
+		f.Close()
+		return nil, fmt.Errorf("failed to read stored metadata: %w", err)
+	}
+	return &packetReader{Reader: reader, Closer: f}, nil
+}
+
+type packetReader struct {
+	io.Reader
+	io.Closer
+}
+
+// GetMetadata reads only the local metadata prefix, without loading the packet.
+func (s *Store) GetMetadata(packetID uint16) (store.Metadata, error) {
+	s.Lock()
+	defer s.Unlock()
+	f, err := os.Open(s.filePathForId(packetID))
+	if err != nil {
+		return store.Metadata{}, err
+	}
+	metadata, _, readErr := persistence.ReadHeader(f)
+	closeErr := f.Close()
+	if readErr != nil {
+		return store.Metadata{}, readErr
+	}
+	return metadata, closeErr
 }
 
 // Delete removes the message with the specified store ID
@@ -193,6 +235,9 @@ func (s *Store) list() ([]uint16, error) {
 			continue
 		}
 		fn := entry.Name()
+		if strings.HasSuffix(fn, s.extension+tmpExtension) || strings.HasSuffix(fn, s.extension+corruptExtension) {
+			continue
+		}
 		if match, err := filepath.Match(s.prefix+"*"+s.extension, fn); err != nil {
 			return nil, fmt.Errorf("failed to read match %s: %w", fn, err)
 		} else if !match {
@@ -212,7 +257,7 @@ func (s *Store) list() ([]uint16, error) {
 	sort.Slice(ids, func(i, j int) bool {
 		return ids[i].modTime.Before(ids[j].modTime)
 	})
-	ret := make([]uint16, len(entries))
+	ret := make([]uint16, len(ids))
 	for i := range ids {
 		ret[i] = ids[i].id
 	}

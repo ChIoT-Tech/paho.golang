@@ -23,6 +23,7 @@ import (
 
 	"github.com/eclipse/paho.golang/packets"
 	"github.com/eclipse/paho.golang/paho/session"
+	pstore "github.com/eclipse/paho.golang/paho/store"
 )
 
 // TestAddToSessionWhileReconnecting checks that publishing while the connection
@@ -77,7 +78,7 @@ func TestAddToSessionWhileReconnecting(t *testing.T) {
 		for range rounds {
 			pub := packets.NewControlPacket(packets.PUBLISH)
 			pub.Content.(*packets.Publish).QoS = 1
-			_, err := s.AddToSession(context.Background(), pub.Content.(*packets.Publish))
+			_, err := s.AddToSession(context.Background(), pub.Content.(*packets.Publish), pstore.Metadata{})
 			if err != nil && err != session.ErrNoConnection {
 				// Anything else is a real failure; a lost connection is the
 				// expected outcome of racing a disconnect.

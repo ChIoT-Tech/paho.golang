@@ -18,6 +18,8 @@ package queue
 import (
 	"errors"
 	"io"
+
+	"github.com/eclipse/paho.golang/paho/store"
 )
 
 var (
@@ -28,6 +30,10 @@ var (
 // Users must call one of Leave, Remove, or Quarantine when done with the entry (and before calling Peek again)
 // `Reader()` must not be called after calling Leave, Remove, or Quarantine (and any Reader previously requestes should be considered invalid)
 type Entry interface {
+	// Metadata reads local publication metadata independently of the packet.
+	// Wrap store.ErrInvalidMetadata for malformed records that may be quarantined;
+	// other read errors leave the entry available for retry.
+	Metadata() (store.Metadata, error)
 	Reader() (io.Reader, error) // Provides access to the file contents, subsequent calls may return the same reader
 	Leave() error               // Leave the entry in the queue (same entry will be returned on subsequent calls to Peek).
 	Remove() error              // Remove this entry from the queue. Returns queue.ErrEmpty if queue is empty after operation
@@ -41,7 +47,9 @@ type Queue interface {
 	Wait() chan struct{}
 
 	// Enqueue add item to the queue.
-	Enqueue(p io.Reader) error
+	// Packet and metadata must become visible together. Empty metadata is used
+	// for untracked publications; it must not inherit an earlier entry's ID.
+	Enqueue(p io.Reader, metadata store.Metadata) error
 
 	// Peek retrieves the oldest item from the queue without removing it
 	// Users must call one of Close, Remove, or Quarantine when done with the entry, and before calling Peek again.

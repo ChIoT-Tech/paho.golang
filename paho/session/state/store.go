@@ -17,13 +17,18 @@ package state
 
 import (
 	"io"
+
+	"github.com/eclipse/paho.golang/paho/store"
 )
 
 // storer must be implemented by session state stores
 type storer interface {
-	Put(packetID uint16, packetType byte, w io.WriterTo) error // Store the packet
-	Get(packetID uint16) (io.ReadCloser, error)                // Retrieve the packet with the specified in ID
-	Delete(id uint16) error                                    // Removes the message with the specified store ID
+	// Put atomically replaces both packet and metadata. Metadata is explicit on
+	// every write; reusing a packet ID must never inherit the previous owner's ID.
+	Put(packetID uint16, packetType byte, w io.WriterTo, metadata store.Metadata) error
+	Get(packetID uint16) (io.ReadCloser, error)          // Retrieve the packet with the specified in ID
+	GetMetadata(packetID uint16) (store.Metadata, error) // Retrieve local metadata without decoding the packet
+	Delete(id uint16) error                              // Removes the message with the specified store ID
 
 	// Quarantine sets the message with the specified store ID into an error state; this may mean deleting it or storing
 	// it somewhere separate. This is intended for use when a corrupt packet is detected (as this may result in data

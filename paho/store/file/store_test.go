@@ -23,6 +23,7 @@ import (
 	"testing"
 
 	"github.com/eclipse/paho.golang/packets"
+	pstore "github.com/eclipse/paho.golang/paho/store"
 )
 
 // TestFileStore basic tests of the file store
@@ -40,7 +41,7 @@ func TestFileStore(t *testing.T) {
 		pcp.Content.(*packets.Publish).QoS = 1 // ID will only be written for QOS1+
 		pcp.Content.(*packets.Publish).Payload = []byte(fmt.Sprintf("%d", id))
 
-		if err := s.Put(id, packets.PUBLISH, pcp); err != nil {
+		if err := s.Put(id, packets.PUBLISH, pcp, pstore.Metadata{}); err != nil {
 			t.Fatalf("failed to put: %s", err)
 		}
 	}
@@ -112,7 +113,7 @@ func TestFileStoreNaming(t *testing.T) {
 
 	msg := bytes.NewReader([]byte("random file contents"))
 
-	if err := s.Put(1, packets.PUBLISH, msg); err != nil {
+	if err := s.Put(1, packets.PUBLISH, msg, pstore.Metadata{}); err != nil {
 		t.Fatalf("failed to put: %s", err)
 	}
 

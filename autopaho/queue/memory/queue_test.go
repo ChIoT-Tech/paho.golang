@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/eclipse/paho.golang/autopaho/queue"
+	pstore "github.com/eclipse/paho.golang/paho/store"
 )
 
 // TestMemoryQueue some basic tests of the queue
@@ -45,7 +46,7 @@ func TestMemoryQueue(t *testing.T) {
 	default:
 	}
 	testEntry := []byte("This is a test")
-	if err := q.Enqueue(bytes.NewReader(testEntry)); err != nil {
+	if err := q.Enqueue(bytes.NewReader(testEntry), pstore.Metadata{}); err != nil {
 		t.Fatalf("error adding to queue: %s", err)
 	}
 	select {
@@ -56,7 +57,7 @@ func TestMemoryQueue(t *testing.T) {
 
 	const entryFormat = "Queue entry %d for testing"
 	for i := 0; i < 10; i++ {
-		if err := q.Enqueue(bytes.NewReader([]byte(fmt.Sprintf(entryFormat, i)))); err != nil {
+		if err := q.Enqueue(bytes.NewReader([]byte(fmt.Sprintf(entryFormat, i))), pstore.Metadata{}); err != nil {
 			t.Fatalf("error adding entry %d: %s", i, err)
 		}
 	}
@@ -105,7 +106,7 @@ func TestLeaveAndQuarantine(t *testing.T) {
 	}
 
 	testEntry := []byte("This is a test")
-	if err := q.Enqueue(bytes.NewReader(testEntry)); err != nil {
+	if err := q.Enqueue(bytes.NewReader(testEntry), pstore.Metadata{}); err != nil {
 		t.Fatalf("error adding to queue: %s", err)
 	}
 
